@@ -17,3 +17,5 @@ npm run dev
 ```
 
 http://localhost:3000 에서 확인.
+
+Vercel deployment test - October 5, 2026
