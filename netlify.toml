@@ -1,0 +1,9 @@
+[build]
+  command = "next build"
+  publish = ".next"
+
+# Netlify auto-detects Next.js 13.5+ and applies the OpenNext adapter —
+# no extra plugin config needed. Environment variables (NEXT_PUBLIC_
+# SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY) are NOT read from this
+# file; set them in the Netlify UI or CLI as described in
+# MIGRATION_GUIDE.md.
