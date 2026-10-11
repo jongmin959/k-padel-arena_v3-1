@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Trophy,
   Users,
@@ -14,16 +14,25 @@ import {
   ChevronDown,
   Grid3x3,
   UserPlus,
+  LogIn,
   Trash2,
   UserCircle,
   LogOut,
   Share2,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient";
-import { signUpWithUsername, signInWithUsername, signOut, getCurrentProfile } from "./lib/auth";
 import {
-  getMyClub,
-  createClub,
+  signUpWithUsername,
+  signInWithUsername,
+  signOut,
+  changePassword,
+  getCurrentProfile,
+  validateUsername,
+  MIN_PASSWORD_LENGTH,
+} from "./lib/auth";
+import {
+  getSharedClub,
+  joinSharedClub,
   updateClub,
   getClubPlayers,
   addGuestPlayer,
@@ -836,6 +845,7 @@ export default function PadelLeagueApp() {
       email: row.email,
       phone: row.phone,
       gender: row.gender,
+      needsPasswordReset: !!row.needs_password_reset,
     };
 
   // teams/tournament are session-local only (not yet in Supabase — see
@@ -866,42 +876,46 @@ export default function PadelLeagueApp() {
     if (club) setLeague((prev) => assembleLeague(club, players, rounds, bookings, prev));
   }, []);
 
-  const loadEverything = useCallback(async () => {
-    setLoading(true);
+  // Only the most recent load may update state, so a slow earlier load (e.g.
+  // the one triggered by the auth listener mid-signup) can never overwrite
+  // the result of a later one.
+  const loadSeq = useRef(0);
+
+  const loadEverything = useCallback(async ({ silent = false } = {}) => {
+    const seq = ++loadSeq.current;
+    const isLatest = () => seq === loadSeq.current;
+    if (!silent) setLoading(true);
     try {
       const profile = await getCurrentProfile();
-      setCurrentMember(mapProfile(profile));
 
-      let club = null;
-      if (profile) {
-        club = await getMyClub(profile.id);
-        if (!club) club = await createClub(profile.id, { venue: VENUES[0] });
-      } else {
-        const { data } = await supabase.from("clubs").select("*").order("created_at", { ascending: true }).limit(1).maybeSingle();
-        club = data || null;
-      }
+      // One shared club for everyone. A signed-in user joins it; nothing
+      // here ever creates a club. If none exists yet, league stays null and
+      // the app shows a "club not ready" screen.
+      const club = profile ? await joinSharedClub(profile.id) : await getSharedClub();
 
+      let next = null;
       if (club) {
         const [players, rounds, bookings] = await Promise.all([
           getClubPlayers(club.id),
           getRounds(club.id),
           getBookings(club.id),
         ]);
-        setLeague(assembleLeague(club, players, rounds, bookings));
-      } else {
-        setLeague(null);
+        next = { club, players, rounds, bookings };
       }
+      if (!isLatest()) return;
+      setCurrentMember(mapProfile(profile));
+      setLeague(next ? assembleLeague(next.club, next.players, next.rounds, next.bookings) : null);
     } catch (e) {
-      setLeague(null);
+      if (isLatest()) setLeague(null);
     } finally {
-      setLoading(false);
+      if (isLatest()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     loadEverything();
     const { data: sub } = supabase.auth.onAuthStateChange(() => {
-      loadEverything();
+      loadEverything({ silent: true });
     });
     return () => sub?.subscription?.unsubscribe();
   }, [loadEverything]);
@@ -1039,42 +1053,42 @@ export default function PadelLeagueApp() {
      Auth
   --------------------------------------------------------------- */
   const signUp = useCallback(
-    async ({ name, username, password, phone, email, gender, region, level, photo }) => {
-      const result = await signUpWithUsername({ username, password, name, phone, email, gender, region, level, photoUrl: photo });
-      if (result.error) {
-        return { error: result.error.message === "duplicate_username" ? "duplicate_username" : result.error.message };
-      }
-      const profile = await getCurrentProfile();
-      setCurrentMember(mapProfile(profile));
-
-      if (league) {
-        try {
-          await joinClubAsPlayer(league.id, result.user.id);
-        } catch (e) {
-          // best effort; RLS or race — not fatal to signup itself
-        }
-        await reloadClubData(league.id);
-      } else {
-        const club = await createClub(result.user.id, { venue: VENUES[0] });
-        await reloadClubData(club.id);
-      }
+    async ({ name, username, password }) => {
+      const result = await signUpWithUsername({ username, password, name });
+      if (result.error) return { error: result.error.message };
+      // Re-read everything from the database: profile, club membership, data.
+      await loadEverything({ silent: true });
       return { user: result.user };
     },
-    [league, reloadClubData]
+    [loadEverything]
   );
 
-  const loginWithPassword = useCallback(async (username, password) => {
-    const result = await signInWithUsername(username, password);
-    if (result.error) return { error: result.error.message };
-    const profile = await getCurrentProfile();
-    setCurrentMember(mapProfile(profile));
-    const club = await getMyClub(result.user.id);
-    if (club) {
-      const [players, rounds, bookings] = await Promise.all([getClubPlayers(club.id), getRounds(club.id), getBookings(club.id)]);
-      setLeague(assembleLeague(club, players, rounds, bookings));
-    }
-    return { user: result.user };
-  }, []);
+  const loginWithPassword = useCallback(
+    async (username, password) => {
+      const result = await signInWithUsername(username, password);
+      if (result.error) return { error: result.error.message };
+      const profile = await getCurrentProfile();
+      await loadEverything({ silent: true });
+      return { user: result.user, needsPasswordReset: !!profile?.needs_password_reset };
+    },
+    [loadEverything]
+  );
+
+  const handleChangePassword = useCallback(
+    async (newPassword) => {
+      const result = await changePassword(newPassword);
+      if (!result.error && currentMember?.id) {
+        try {
+          await supabase.from("profiles").update({ needs_password_reset: false }).eq("id", currentMember.id);
+          setCurrentMember((prev) => prev && { ...prev, needsPasswordReset: false });
+        } catch (e) {
+          // clearing the flag is best effort
+        }
+      }
+      return result;
+    },
+    [currentMember]
+  );
 
   const logout = useCallback(async () => {
     await signOut();
@@ -1243,8 +1257,19 @@ export default function PadelLeagueApp() {
           textAlign: "center",
         }}
       >
-        <div>아직 만들어진 클럽이 없어요.</div>
-        <PrimaryButton onClick={() => setAuthModalOpen(true)}>회원가입하고 클럽 만들기</PrimaryButton>
+        <div>클럽이 아직 준비되지 않았어요.</div>
+        <div style={{ fontSize: 13, color: "rgba(27,36,34,0.55)", maxWidth: 280 }}>
+          클럽 관리자가 클럽을 만들면 자동으로 참여돼요.
+        </div>
+        {currentMember ? (
+          <PrimaryButton onClick={logout} icon={LogOut}>
+            로그아웃
+          </PrimaryButton>
+        ) : (
+          <PrimaryButton onClick={() => setAuthModalOpen(true)} icon={LogIn}>
+            로그인 · 회원가입
+          </PrimaryButton>
+        )}
         {authModalOpen && (
           <AuthModal
             members={[{}]}
@@ -1252,6 +1277,7 @@ export default function PadelLeagueApp() {
             onLoginWithPassword={loginWithPassword}
             onLogout={logout}
             onSignUp={signUp}
+            onChangePassword={handleChangePassword}
             onUploadProfilePhoto={updateProfilePhoto}
             onSetProfilePhotoUrl={updateProfilePhotoUrl}
             onUpdateLevel={updateProfileLevel}
@@ -1822,6 +1848,7 @@ export default function PadelLeagueApp() {
           onLoginWithPassword={loginWithPassword}
           onLogout={logout}
           onSignUp={signUp}
+            onChangePassword={handleChangePassword}
           onUploadProfilePhoto={updateProfilePhoto}
           onSetProfilePhotoUrl={updateProfilePhotoUrl}
           onUpdateLevel={updateProfileLevel}
@@ -2003,77 +2030,97 @@ function LevelSlider({ value, onChange }) {
   );
 }
 
+const authInputStyle = {
+  padding: "10px 12px",
+  borderRadius: 10,
+  border: "1px solid rgba(0,0,0,0.15)",
+  fontSize: 14,
+};
+
 function AuthModal({
   members,
   currentMember,
   onLoginWithPassword,
   onLogout,
   onSignUp,
+  onChangePassword,
   onUploadProfilePhoto,
   onSetProfilePhotoUrl,
   onUpdateLevel,
   profileUploading,
   onClose,
 }) {
-  const [mode, setMode] = useState(currentMember ? "profile" : members.length ? "login" : "signup");
+  // home -> login | signup ; login -> reset ; profile once signed in
+  const [mode, setMode] = useState(currentMember ? "profile" : "home");
   const [name, setName] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [passwordConfirm, setPasswordConfirm] = useState("");
-  const [phone, setPhone] = useState("");
-  const [email, setEmail] = useState("");
-  const [gender, setGender] = useState("");
-  const [region, setRegion] = useState("");
-  const [level, setLevel] = useState(3.0);
-  const [signupPhoto, setSignupPhoto] = useState(null); // preview: object URL or pasted URL
-  const [signupPhotoFile, setSignupPhotoFile] = useState(null); // raw File, uploaded after account exists
   const [signupError, setSignupError] = useState("");
+  const [signupBusy, setSignupBusy] = useState(false);
 
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
 
-  const submitSignUp = async () => {
-    const trimmed = name.trim();
-    const trimmedUsername = username.trim();
-    setSignupError("");
-    if (!trimmed) return;
-    if (!trimmedUsername) {
-      setSignupError("아이디를 입력해 주세요.");
+  const [newPassword, setNewPassword] = useState("");
+  const [newPasswordConfirm, setNewPasswordConfirm] = useState("");
+  const [pwMessage, setPwMessage] = useState({ text: "", ok: false });
+
+  const submitPasswordChange = async () => {
+    setPwMessage({ text: "", ok: false });
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setPwMessage({ text: `비밀번호는 ${MIN_PASSWORD_LENGTH}자 이상이어야 해요.`, ok: false });
       return;
     }
-    if (password.length < 4) {
-      setSignupError("비밀번호는 4자 이상으로 입력해 주세요.");
+    if (newPassword !== newPasswordConfirm) {
+      setPwMessage({ text: "새 비밀번호가 일치하지 않아요.", ok: false });
+      return;
+    }
+    const result = await onChangePassword(newPassword);
+    if (result && result.error) {
+      setPwMessage({ text: "비밀번호를 변경하지 못했어요. 잠시 후 다시 시도해 주세요.", ok: false });
+      return;
+    }
+    setNewPassword("");
+    setNewPasswordConfirm("");
+    setPwMessage({ text: "비밀번호가 변경되었어요.", ok: true });
+  };
+
+  const SIGNUP_ERRORS = {
+    duplicate_username: "이미 사용 중인 아이디예요. 기존 회원이라면 로그인해 주세요.",
+    invalid_username: "아이디는 영문 소문자, 숫자, _ 로 3~20자여야 해요.",
+    weak_password: `비밀번호는 ${MIN_PASSWORD_LENGTH}자 이상으로 입력해 주세요.`,
+    email_confirmation_required: "가입 설정에 문제가 있어요. 관리자에게 문의해 주세요.",
+  };
+
+  const submitSignUp = async () => {
+    const trimmedName = name.trim();
+    const trimmedUsername = username.trim().toLowerCase();
+    setSignupError("");
+    if (!trimmedName) {
+      setSignupError("이름을 입력해 주세요.");
+      return;
+    }
+    if (!validateUsername(trimmedUsername)) {
+      setSignupError(SIGNUP_ERRORS.invalid_username);
+      return;
+    }
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      setSignupError(SIGNUP_ERRORS.weak_password);
       return;
     }
     if (password !== passwordConfirm) {
       setSignupError("비밀번호가 일치하지 않아요.");
       return;
     }
-    const result = await onSignUp({
-      name: trimmed,
-      username: trimmedUsername,
-      password,
-      phone,
-      email,
-      gender,
-      region,
-      level,
-      // A pasted URL can be saved immediately; a picked file needs a
-      // real account to exist first, so it's uploaded just below instead.
-      photo: signupPhotoFile ? null : signupPhoto,
-    });
-    if (result && result.error === "duplicate_username") {
-      setSignupError("이미 사용 중인 아이디예요.");
-      return;
-    }
+    setSignupBusy(true);
+    const result = await onSignUp({ name: trimmedName, username: trimmedUsername, password });
+    setSignupBusy(false);
     if (result && result.error) {
-      setSignupError("가입에 실패했어요. 잠시 후 다시 시도해 주세요.");
+      setSignupError(SIGNUP_ERRORS[result.error] || "가입에 실패했어요. 잠시 후 다시 시도해 주세요.");
       return;
-    }
-    if (signupPhotoFile) {
-      await onUploadProfilePhoto(signupPhotoFile);
     }
     setMode("profile");
   };
@@ -2091,8 +2138,33 @@ function AuthModal({
       setLoginError("아이디 또는 비밀번호가 올바르지 않아요.");
       return;
     }
+    if (result && result.needsPasswordReset) {
+      setMode("profile");
+      return;
+    }
     onClose();
   };
+
+  const linkBtn = {
+    background: "none",
+    border: "none",
+    color: C.turf,
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: "pointer",
+    padding: 4,
+  };
+
+  const title =
+    mode === "profile"
+      ? "내 프로필"
+      : mode === "login"
+      ? "로그인"
+      : mode === "signup"
+      ? "회원가입"
+      : mode === "reset"
+      ? "비밀번호 재설정"
+      : "K-PADEL ARENA";
 
   return (
     <div
@@ -2120,9 +2192,7 @@ function AuthModal({
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <Eyebrow>
-            {mode === "profile" ? "내 프로필" : mode === "login" ? "로그인" : "회원가입"}
-          </Eyebrow>
+          <Eyebrow>{title}</Eyebrow>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer" }}>
             <X size={20} color={C.charcoal} />
           </button>
@@ -2173,6 +2243,35 @@ function AuthModal({
 
             <LevelSlider value={currentMember.level} onChange={onUpdateLevel} />
 
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>비밀번호 변경</div>
+              {currentMember.needsPasswordReset && (
+                <div style={{ fontSize: 12, color: C.danger }}>
+                  기존 계정에서 이전된 계정이에요. 새 비밀번호를 설정해 주세요.
+                </div>
+              )}
+              <input
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder={`새 비밀번호 (${MIN_PASSWORD_LENGTH}자 이상)`}
+                style={authInputStyle}
+              />
+              <input
+                type="password"
+                value={newPasswordConfirm}
+                onChange={(e) => setNewPasswordConfirm(e.target.value)}
+                placeholder="새 비밀번호 확인"
+                style={authInputStyle}
+              />
+              {pwMessage.text && (
+                <div style={{ fontSize: 12, color: pwMessage.ok ? C.turf : C.danger }}>{pwMessage.text}</div>
+              )}
+              <PrimaryButton onClick={submitPasswordChange} disabled={!newPassword}>
+                비밀번호 변경
+              </PrimaryButton>
+            </div>
+
             <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
               {members.length > 1 && (
                 <PrimaryButton
@@ -2189,166 +2288,114 @@ function AuthModal({
           </div>
         )}
 
+        {mode === "home" && (
+          <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <PrimaryButton onClick={() => setMode("login")} icon={LogIn}>
+                로그인
+              </PrimaryButton>
+              <div style={{ marginTop: 6, fontSize: 12, color: "rgba(27,36,34,0.55)", textAlign: "center" }}>
+                기존 회원이신가요?
+              </div>
+            </div>
+            <div>
+              <PrimaryButton
+                onClick={() => setMode("signup")}
+                icon={UserPlus}
+                style={{ background: "transparent", color: C.charcoal, border: "1px solid rgba(0,0,0,0.2)" }}
+              >
+                회원가입
+              </PrimaryButton>
+              <div style={{ marginTop: 6, fontSize: 12, color: "rgba(27,36,34,0.55)", textAlign: "center" }}>
+                처음 이용하시나요?
+              </div>
+            </div>
+          </div>
+        )}
+
         {mode === "login" && (
           <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-            {members.length === 0 ? (
-              <EmptyHint text="등록된 회원이 없어요. 먼저 회원가입을 해주세요." />
-            ) : (
-              <>
-                <input
-                  value={loginUsername}
-                  onChange={(e) => setLoginUsername(e.target.value)}
-                  placeholder="아이디"
-                  autoCapitalize="off"
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
-                />
-                <input
-                  type="password"
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  placeholder="비밀번호"
-                  onKeyDown={(e) => e.key === "Enter" && submitLogin()}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
-                />
-                {loginError && <div style={{ fontSize: 12, color: C.danger }}>{loginError}</div>}
-                <PrimaryButton onClick={submitLogin} disabled={loginBusy}>
-                  {loginBusy ? "확인 중..." : "로그인"}
-                </PrimaryButton>
-              </>
-            )}
-            <button
-              onClick={() => setMode("signup")}
-              style={{ marginTop: 8, background: "none", border: "none", color: C.turf, fontSize: 13, fontWeight: 700, cursor: "pointer" }}
-            >
-              + 새 회원가입
+            <input
+              value={loginUsername}
+              onChange={(e) => setLoginUsername(e.target.value)}
+              placeholder="아이디"
+              autoCapitalize="off"
+              style={authInputStyle}
+            />
+            <input
+              type="password"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              placeholder="비밀번호"
+              onKeyDown={(e) => e.key === "Enter" && submitLogin()}
+              style={authInputStyle}
+            />
+            {loginError && <div style={{ fontSize: 12, color: C.danger }}>{loginError}</div>}
+            <PrimaryButton onClick={submitLogin} disabled={loginBusy}>
+              {loginBusy ? "확인 중..." : "로그인"}
+            </PrimaryButton>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+              <button onClick={() => setMode("signup")} style={linkBtn}>
+                회원가입 화면으로 이동
+              </button>
+              <button onClick={() => setMode("reset")} style={linkBtn}>
+                비밀번호 재설정
+              </button>
+            </div>
+          </div>
+        )}
+
+        {mode === "reset" && (
+          <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+              이메일로 보내는 자동 재설정은 아직 준비 중이에요.
+              <br />
+              비밀번호를 기억한다면 로그인 후 <b>내 프로필 &gt; 비밀번호 변경</b>에서 바꿀 수 있어요.
+              <br />
+              비밀번호를 잊었다면 클럽 관리자에게 재설정을 요청해 주세요.
+            </div>
+            <button onClick={() => setMode("login")} style={{ ...linkBtn, alignSelf: "flex-start" }}>
+              로그인 화면으로 이동
             </button>
           </div>
         )}
 
         {mode === "signup" && (
-          <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              {signupPhoto ? (
-                <img src={signupPhoto} alt="" style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover" }} />
-              ) : (
-                <div
-                  style={{
-                    width: 56,
-                    height: 56,
-                    borderRadius: "50%",
-                    background: C.paperDim,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  <UserCircle size={30} color="rgba(27,36,34,0.4)" />
-                </div>
-              )}
-              <PhotoInput
-                label="프로필 사진"
-                uploading={false}
-                onFile={(file) => {
-                  setSignupPhotoFile(file);
-                  setSignupPhoto(URL.createObjectURL(file));
-                }}
-                onSetUrl={(url) => {
-                  setSignupPhotoFile(null);
-                  setSignupPhoto(url);
-                }}
-              />
-            </div>
-
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="이름"
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
-            />
+          <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="이름" style={authInputStyle} />
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="아이디"
+              placeholder="아이디 (영문 소문자·숫자·_, 3~20자)"
               autoCapitalize="off"
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
+              style={authInputStyle}
             />
             <input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="비밀번호 (4자 이상)"
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
+              placeholder={`비밀번호 (${MIN_PASSWORD_LENGTH}자 이상)`}
+              style={authInputStyle}
             />
             <input
               type="password"
               value={passwordConfirm}
               onChange={(e) => setPasswordConfirm(e.target.value)}
               placeholder="비밀번호 확인"
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
+              onKeyDown={(e) => e.key === "Enter" && submitSignUp()}
+              style={authInputStyle}
             />
-            <select
-              value={region}
-              onChange={(e) => setRegion(e.target.value)}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14, color: region ? C.charcoal : "rgba(27,36,34,0.4)" }}
-            >
-              <option value="">지역 선택 (선택)</option>
-              {REGIONS.map((r) => (
-                <option key={r} value={r}>{r}</option>
-              ))}
-            </select>
-            <div style={{ display: "flex", gap: 6 }}>
-              {[
-                { key: "male", label: "Male" },
-                { key: "female", label: "Female" },
-              ].map((g) => (
-                <button
-                  key={g.key}
-                  type="button"
-                  onClick={() => setGender(g.key)}
-                  style={{
-                    flex: 1,
-                    padding: "9px 12px",
-                    borderRadius: 10,
-                    border: `1px solid ${gender === g.key ? C.turf : "rgba(0,0,0,0.15)"}`,
-                    background: gender === g.key ? C.turf : "transparent",
-                    color: gender === g.key ? "#fff" : C.charcoal,
-                    fontSize: 13,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  {g.label}
-                </button>
-              ))}
-            </div>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="이메일 (선택)"
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
-            />
-            <input
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              placeholder="연락처 (선택)"
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)", fontSize: 14 }}
-            />
-            <LevelSlider value={level} onChange={setLevel} />
-
             {signupError && <div style={{ fontSize: 12, color: C.danger }}>{signupError}</div>}
-
-            <PrimaryButton onClick={submitSignUp} icon={UserPlus} disabled={!name.trim() || !username.trim() || password.length < 4}>
-              가입하기
+            <PrimaryButton
+              onClick={submitSignUp}
+              icon={UserPlus}
+              disabled={signupBusy || !name.trim() || !username.trim() || !password}
+            >
+              {signupBusy ? "가입 중..." : "회원가입"}
             </PrimaryButton>
-            {members.length > 0 && (
-              <button
-                onClick={() => setMode("login")}
-                style={{ background: "none", border: "none", color: "rgba(27,36,34,0.5)", fontSize: 13, cursor: "pointer" }}
-              >
-                이미 계정이 있어요
-              </button>
-            )}
+            <button onClick={() => setMode("login")} style={{ ...linkBtn, alignSelf: "center" }}>
+              로그인 화면으로 이동
+            </button>
           </div>
         )}
       </div>
