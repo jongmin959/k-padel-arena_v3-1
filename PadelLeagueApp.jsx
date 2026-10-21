@@ -2116,7 +2116,18 @@ function AuthModal({
       return;
     }
     setSignupBusy(true);
-    const result = await onSignUp({ name: trimmedName, username: trimmedUsername, password });
+    let result;
+try {
+  result = await onSignUp({
+    name: trimmedName,
+    username: trimmedUsername,
+    password,
+  });
+} catch (e) {
+  alert(`회원가입 오류: ${e?.message || String(e)}`);
+  setSignupBusy(false);
+  return;
+}
     setSignupBusy(false);
     if (result && result.error) {
       setSignupError(SIGNUP_ERRORS[result.error] || "가입에 실패했어요. 잠시 후 다시 시도해 주세요.");
